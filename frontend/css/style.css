@@ -2121,15 +2121,16 @@ body.cli-mode .settings-btn {
     max-width: 100%;
 }
 
-/* loader column on the left of the pill (spinner + breathing dot).
-   Integer pixel dimensions + flex-centered SVG to keep the rotating
-   spokes pinned exactly at the visual center — sub-pixel raster shifts
-   were making the spinner appear to drift up/down at 1.6rem (25.6px). */
+/* loader column on the left of the pill.
+   Size is locked to 24px so it's a clean 1:1 with the SVG's
+   viewBox="0 0 24 24" — every user unit lands on a CSS pixel boundary,
+   eliminating the sub-pixel raster wobble that made the rotating
+   spokes appear to drift in a small circle. */
 .cli-pill-loader {
     position: relative;
     flex: 0 0 auto;
-    width: 26px;
-    height: 26px;
+    width: 24px;
+    height: 24px;
     align-self: center;
     display: flex;
     align-items: center;
@@ -2138,59 +2139,18 @@ body.cli-mode .settings-btn {
 
 .cli-pill-icon {
     display: block;
-    height: 26px;
-    width: 26px;
+    height: 24px;
+    width: 24px;
     stroke: rgba(107, 114, 128, 1);
     animation: cli-pill-spin 1s linear infinite;
     will-change: transform;
-    transform-origin: 50% 50%;
-    transform-box: fill-box;
+    transform-origin: center;
     backface-visibility: hidden;
     shape-rendering: geometricPrecision;
 }
 
 @keyframes cli-pill-spin {
     to { transform: rotate(360deg); }
-}
-
-.cli-pill-dot {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    width: 0.42rem;
-    height: 0.42rem;
-    border-radius: 50%;
-    background: linear-gradient(135deg, #d880be 0%, #8782eb 55%, #6ec5e9 100%);
-    box-shadow: 0 0 3px rgba(216, 128, 190, 0.8),
-                0 0 6px rgba(168, 110, 235, 0.55);
-    transform: translate(-50%, -50%);
-    pointer-events: none;
-}
-
-.cli-pill-dot::before {
-    content: '';
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    width: 1.05rem;
-    height: 1.05rem;
-    border-radius: 50%;
-    background: radial-gradient(
-        circle,
-        rgba(216, 128, 190, 0.65) 0%,
-        rgba(168, 110, 235, 0.40) 45%,
-        transparent 80%
-    );
-    transform: translate(-50%, -50%) scale(0.6);
-    will-change: transform, opacity;
-    animation: cli-dot-breathe 2.2s ease-in-out infinite;
-    pointer-events: none;
-    z-index: -1;
-}
-
-@keyframes cli-dot-breathe {
-    0%, 100% { transform: translate(-50%, -50%) scale(0.6); opacity: 0.5; }
-    50%      { transform: translate(-50%, -50%) scale(1);   opacity: 1;   }
 }
 
 /* status glyph — hidden until pill goes complete */
@@ -2270,12 +2230,6 @@ body.cli-mode .settings-btn {
 /* ---------- complete state ---------- */
 
 .cli-pill.complete .cli-pill-icon {
-    opacity: 0;
-    animation-play-state: paused;
-}
-
-.cli-pill.complete .cli-pill-dot,
-.cli-pill.complete .cli-pill-dot::before {
     opacity: 0;
     animation-play-state: paused;
 }

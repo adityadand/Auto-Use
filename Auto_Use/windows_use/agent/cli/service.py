@@ -44,13 +44,36 @@ except ImportError:
 
 # =============================================================================
 # FIX FOR COMPILED CLI SUBPROCESS: Ensure stdout/stderr are valid
-# In compiled Windows apps with CREATE_NO_WINDOW, these can be None/closed
+# PyInstaller --windowed builds (and CREATE_NO_WINDOW spawns on Windows) set
+# sys.stdout/stderr to None at startup. When the main agent spawns this
+# binary as a subprocess via `subprocess.Popen(..., stdout=PIPE, stderr=PIPE)`,
+# the OS-level fds 1 and 2 ARE valid pipe ends connected to the parent's
+# reader threads — we just need a Python wrapper around them so safe_print()
+# actually flows through. Falling back to io.StringIO() (the old behavior)
+# silently swallowed every line, which is exactly why the streaming pill
+# stayed empty in the .exe.
 # =============================================================================
-if sys.stdout is None or (hasattr(sys.stdout, 'closed') and sys.stdout.closed):
-    sys.stdout = io.StringIO()
+def _ensure_real_stdio_or_fallback():
+    for name, fd in (('stdout', 1), ('stderr', 2)):
+        stream = getattr(sys, name, None)
+        if stream is not None and not (hasattr(stream, 'closed') and stream.closed):
+            continue  # already valid (dev mode) — leave it alone
+        try:
+            raw = os.fdopen(fd, 'wb', buffering=0, closefd=False)
+            wrapped = io.TextIOWrapper(
+                raw,
+                encoding='utf-8',
+                errors='replace',
+                write_through=True,
+                line_buffering=False,
+            )
+            setattr(sys, name, wrapped)
+        except OSError:
+            # fd is unusable (truly headless, no parent pipe) — last-resort
+            # in-memory buffer so safe_print doesn't raise.
+            setattr(sys, name, io.StringIO())
 
-if sys.stderr is None or (hasattr(sys.stderr, 'closed') and sys.stderr.closed):
-    sys.stderr = io.StringIO()
+_ensure_real_stdio_or_fallback()
 
 # Safe print function that won't crash on closed stdout
 def safe_print(*args, **kwargs):
