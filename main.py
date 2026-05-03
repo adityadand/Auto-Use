@@ -29,11 +29,11 @@ else:
 
 # Configuration
 PROVIDER = "openrouter"
-MODEL = "gemini-3.1-pro" #refer to the model name correctly from model_list.txt.
+MODEL = "gemini-3-flash" #refer to the model name correctly from model_list.txt.
 # Your task here
 task = """
 
-pure apple script . open the apple map and search for the destination feltham to currentl location only applscript allowed
+make a dummy report of nvdai on deskop using cli  agent
 """
 
 # Control conversation saving
@@ -42,7 +42,12 @@ conversation = True  # Set to False to disable conversation.txt
 thinking = True  # Set to True to enable reasoning for supported models
 
 # Run the agent
-agent = AgentService(provider=PROVIDER, model=MODEL, save_conversation=conversation)
+agent = AgentService(
+    provider=PROVIDER,
+    model=MODEL,
+    save_conversation=conversation,
+    external_terminal=True,
+)
 agent.process_request(task)
 
 # Response is displayed inside process_request

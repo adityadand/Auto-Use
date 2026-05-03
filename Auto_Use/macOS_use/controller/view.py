@@ -22,6 +22,7 @@ import logging
 import time
 import sys
 import os
+import shlex
 import threading
 import subprocess
 from pathlib import Path
@@ -46,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 class ControllerView:
-    def __init__(self, provider: str = None, model: str = None, cli_mode: bool = False, session_id: str = None, web_callback=None, shell_callback=None, cli_callback=None, api_key: str = None, stop_event=None):
+    def __init__(self, provider: str = None, model: str = None, cli_mode: bool = False, session_id: str = None, web_callback=None, shell_callback=None, cli_callback=None, api_key: str = None, stop_event=None, external_terminal: bool = False):
         """Initialize the Controller View - central router for all actions
 
         Args:
@@ -59,11 +60,13 @@ class ControllerView:
             cli_callback: Optional callback for CLI agent streaming (await_start/task_start/task_line/task_end/await_end)
             api_key: Optional runtime API key for LLM providers (passed to CLI agent)
             stop_event: Optional threading.Event for stopping actions mid-execution
+            external_terminal: If True, dispatched CLI sub-agents are launched in their own visible OS terminal window (Terminal.app on macOS) instead of having their stdout/stderr piped back. Used by main.py headless mode so the user can watch sub-agent progress live.
         """
         self.cli_mode = cli_mode
         self.session_id = session_id
         self.api_key = api_key
         self.stop_event = stop_event
+        self.external_terminal = external_terminal
         self.controller_service = ControllerService(stop_event=stop_event)
         self.task_tracker = TaskTrackerService(cli_mode=cli_mode, session_id=session_id)
         self.milestone_service = MilestoneService(cli_mode=cli_mode, session_id=session_id)
@@ -103,6 +106,34 @@ class ControllerView:
             self.cli_callback(event_type, *args)
         except Exception as e:
             logger.error(f"cli_callback({event_type}) failed: {e}")
+
+    def _spawn_cli_external_terminal(self, cli_cmd: list, task_description: str):
+        """Spawn the CLI sub-agent in a new visible Terminal.app window on macOS.
+
+        Uses osascript to open Terminal.app and run the same `cli_cmd` the
+        piped path would run. The user sees the sub-agent's live output in
+        its own window. Completion is still detected via the result-file
+        watcher, so we don't need a Popen handle here. Returns None.
+        """
+        repo_root = os.getcwd()
+        inner = " ".join(shlex.quote(arg) for arg in cli_cmd)
+        shell_line = f"cd {shlex.quote(repo_root)} && {inner}"
+        # Escape for the AppleScript string literal: backslashes then double-quotes.
+        escaped = shell_line.replace("\\", "\\\\").replace('"', '\\"')
+        title = task_description[:60].replace('"', "'")
+        apple_script = (
+            f'tell application "Terminal"\n'
+            f'  activate\n'
+            f'  do script "{escaped}"\n'
+            f'  set custom title of front window to "CLI Agent: {title}"\n'
+            f'end tell'
+        )
+        try:
+            subprocess.Popen(["osascript", "-e", apple_script])
+            debug_log(f"CLI sub-agent launched in external Terminal.app window: {task_description[:80]}")
+        except Exception as e:
+            debug_log(f"Failed to spawn external Terminal for CLI sub-agent: {e}", "ERROR")
+        return None
 
     def _read_cli_stream(self, pipe, task_id: str, stream: str):
         """Reader thread: forwards each line from a subprocess pipe to the frontend.
@@ -489,23 +520,30 @@ class ControllerView:
                     if self.api_key:
                         cli_cmd.extend(["--api_key", self.api_key])
 
-                    # Start subprocess. Force unbuffered stdout/stderr in the
-                    # child so our reader thread sees lines as they're printed
-                    # — without this, Python block-buffers when not connected
-                    # to a TTY and the streaming UI feels frozen.
                     cli_env = os.environ.copy()
                     cli_env["PYTHONUNBUFFERED"] = "1"
                     cli_proc = None
-                    try:
-                        cli_proc = subprocess.Popen(
-                            cli_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            env=cli_env
-                        )
-                        debug_log(f"CLI subprocess started (PID: {cli_proc.pid})")
-                    except Exception as e:
-                        debug_log(f"CLI subprocess failed to start: {e}", "ERROR")
+
+                    if self.external_terminal:
+                        # Headless main.py mode: open Terminal.app so the user
+                        # can watch the sub-agent live. Completion still flows
+                        # through the result-file watcher below.
+                        self._spawn_cli_external_terminal(cli_cmd, task_description)
+                    else:
+                        # Start subprocess. Force unbuffered stdout/stderr in the
+                        # child so our reader thread sees lines as they're printed
+                        # — without this, Python block-buffers when not connected
+                        # to a TTY and the streaming UI feels frozen.
+                        try:
+                            cli_proc = subprocess.Popen(
+                                cli_cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=cli_env
+                            )
+                            debug_log(f"CLI subprocess started (PID: {cli_proc.pid})")
+                        except Exception as e:
+                            debug_log(f"CLI subprocess failed to start: {e}", "ERROR")
 
                     # Track in active list
                     task_id = result_file.stem

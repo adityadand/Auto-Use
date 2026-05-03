@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 class ControllerView:
-    def __init__(self, provider: str = None, model: str = None, cli_mode: bool = False, session_id: str = None, web_callback=None, shell_callback=None, cli_callback=None, api_key: str = None, stop_event=None):
+    def __init__(self, provider: str = None, model: str = None, cli_mode: bool = False, session_id: str = None, web_callback=None, shell_callback=None, cli_callback=None, api_key: str = None, stop_event=None, external_terminal: bool = False):
         """Initialize the Controller View - central router for all actions
 
         Args:
@@ -59,11 +59,13 @@ class ControllerView:
             cli_callback: Optional callback for CLI agent streaming (await_start/task_start/task_line/task_end/await_end)
             api_key: Optional runtime API key for LLM providers (passed to CLI agent)
             stop_event: Optional threading.Event for stopping actions mid-execution
+            external_terminal: If True, dispatched CLI sub-agents are launched in their own visible cmd console (CREATE_NEW_CONSOLE) instead of having their stdout/stderr piped back. Used by main.py headless mode so the user can watch sub-agent progress live.
         """
         self.cli_mode = cli_mode
         self.session_id = session_id
         self.api_key = api_key
         self.stop_event = stop_event
+        self.external_terminal = external_terminal
         self.controller_service = ControllerService(stop_event=stop_event)
         self.task_tracker = TaskTrackerService(cli_mode=cli_mode, session_id=session_id)
         self.milestone_service = MilestoneService(cli_mode=cli_mode, session_id=session_id)
@@ -458,24 +460,46 @@ class ControllerView:
                     if self.api_key:
                         cli_cmd.extend(["--api_key", self.api_key])
 
-                    # Start subprocess. Force unbuffered stdout/stderr in the
-                    # child so our reader thread sees lines as they're printed
-                    # — without this, Python block-buffers when not connected
-                    # to a TTY and the streaming UI feels frozen.
                     cli_env = os.environ.copy()
                     cli_env["PYTHONUNBUFFERED"] = "1"
                     cli_proc = None
-                    try:
-                        cli_proc = subprocess.Popen(
-                            cli_cmd,
-                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            env=cli_env
-                        )
-                        debug_log(f"CLI subprocess started (PID: {cli_proc.pid})")
-                    except Exception as e:
-                        debug_log(f"CLI subprocess failed to start: {e}", "ERROR")
+
+                    if self.external_terminal:
+                        # Headless main.py mode: give the sub-agent its own
+                        # visible cmd console so the user can watch it live.
+                        # Output is inherited (no PIPE) — it appears in the
+                        # new console window. CREATE_NEW_CONSOLE keeps the
+                        # Popen handle so stop_cli_agent() can still terminate.
+                        try:
+                            new_console_flag = (
+                                subprocess.CREATE_NEW_CONSOLE
+                                if sys.platform == "win32"
+                                else 0
+                            )
+                            cli_proc = subprocess.Popen(
+                                cli_cmd,
+                                creationflags=new_console_flag,
+                                env=cli_env
+                            )
+                            debug_log(f"CLI sub-agent launched in new console (PID: {cli_proc.pid})")
+                        except Exception as e:
+                            debug_log(f"CLI sub-agent failed to start in new console: {e}", "ERROR")
+                    else:
+                        # Start subprocess. Force unbuffered stdout/stderr in the
+                        # child so our reader thread sees lines as they're printed
+                        # — without this, Python block-buffers when not connected
+                        # to a TTY and the streaming UI feels frozen.
+                        try:
+                            cli_proc = subprocess.Popen(
+                                cli_cmd,
+                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=cli_env
+                            )
+                            debug_log(f"CLI subprocess started (PID: {cli_proc.pid})")
+                        except Exception as e:
+                            debug_log(f"CLI subprocess failed to start: {e}", "ERROR")
 
                     # Track in active list
                     task_id = result_file.stem
@@ -487,9 +511,11 @@ class ControllerView:
                         })
 
                     # Notify frontend a new task has started, then begin
-                    # streaming its stdout/stderr line-by-line.
+                    # streaming its stdout/stderr line-by-line. (Skipped when
+                    # the sub-agent has its own console — its stdout isn't a
+                    # PIPE we can read from.)
                     self._safe_cli_emit("task_start", task_id, task_description)
-                    if cli_proc is not None:
+                    if cli_proc is not None and not self.external_terminal:
                         for pipe, stream_name in (
                             (cli_proc.stdout, "out"),
                             (cli_proc.stderr, "err"),
