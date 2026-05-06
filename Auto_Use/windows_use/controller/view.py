@@ -24,11 +24,12 @@ import sys
 import os
 import threading
 import subprocess
+import uuid
 from pathlib import Path
 
 from .service import ControllerService
 from .task_tracker.service import TaskTrackerService
-from .milestone.service import MilestoneService
+from .scratchpad.service import ScratchpadService
 from .tool import open_on_windows, ShellService
 from .key_combo.service import KeyComboService
 from .tool.web.service import WebService
@@ -46,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 class ControllerView:
-    def __init__(self, provider: str = None, model: str = None, cli_mode: bool = False, session_id: str = None, web_callback=None, shell_callback=None, cli_callback=None, api_key: str = None, stop_event=None, external_terminal: bool = False):
+    def __init__(self, provider: str = None, model: str = None, cli_mode: bool = False, session_id: str = None, web_callback=None, shell_callback=None, cli_callback=None, api_key: str = None, stop_event=None, external_terminal: bool = False, minion_mode: bool = False):
         """Initialize the Controller View - central router for all actions
 
         Args:
@@ -60,15 +61,19 @@ class ControllerView:
             api_key: Optional runtime API key for LLM providers (passed to CLI agent)
             stop_event: Optional threading.Event for stopping actions mid-execution
             external_terminal: If True, dispatched CLI sub-agents are launched in their own visible cmd console (CREATE_NEW_CONSOLE) instead of having their stdout/stderr piped back. Used by main.py headless mode so the user can watch sub-agent progress live.
+            minion_mode: If True, this ControllerView belongs to a minion sub-agent run.
+                The scratchpad redirects to scratchpad/cli_minion/{session_id}/ so
+                the parent CLI agent's cli_milestone/ stays untouched.
         """
         self.cli_mode = cli_mode
         self.session_id = session_id
         self.api_key = api_key
         self.stop_event = stop_event
         self.external_terminal = external_terminal
+        self.minion_mode = minion_mode
         self.controller_service = ControllerService(stop_event=stop_event)
         self.task_tracker = TaskTrackerService(cli_mode=cli_mode, session_id=session_id)
-        self.milestone_service = MilestoneService(cli_mode=cli_mode, session_id=session_id)
+        self.scratchpad_service = ScratchpadService(cli_mode=cli_mode, session_id=session_id, minion_mode=minion_mode)
         self.key_combo_service = KeyComboService(stop_event=stop_event)
         self.cli_service = CLIService(session_id=session_id) if cli_mode else None
         self.screenshot_service = ScreenshotService(self.controller_service)
@@ -85,6 +90,12 @@ class ControllerView:
         self._cli_completed = []      # Done: [{"task": str, "summary": str, "status": str}]
         self._cli_agent_lock = threading.Lock()
         self._cli_await_active = False  # Whether an await_start has been emitted but not yet matched by await_end
+
+        # Minion tracking — parallel to CLI agent but with implicit-blocking semantics:
+        # the action loop dispatches all minions, then blocks at the end until every
+        # spawned minion has written its result. Reuses _cli_agent_lock for thread safety.
+        self._minion_tasks = []       # Active: [{"query": str, "subprocess": Popen, "result_file": Path, "session_id": str}]
+        self._minion_completed = []   # Done: [{"query": str, "session_id": str, "summary": str, "status": str}]
     
     def _web_loading_animation(self):
         """Display animated loading indicator for web search"""
@@ -145,13 +156,33 @@ class ControllerView:
             })
             logger.info(f"CLI Agent completed: {result.get('summary', 'No summary')}")
 
-        # Notify frontend that this task ended (before milestone, so the pill flips first)
+        # Notify frontend that this task ended (before scratchpad write, so the pill flips first)
         self._safe_cli_emit("task_end", task_id, result.get("status", "complete"), result.get("summary", ""))
 
-        # Update milestone with completion status
+        # Update scratchpad with completion status
         cli_task = result.get("task", "Unknown task")
         cli_summary = result.get("summary", "Completed")
-        self.milestone_service.append_milestone(f"CLI Agent finished, task: {cli_task}, status: complete, summary: {cli_summary}")
+        self.scratchpad_service.append_scratchpad(f"CLI Agent finished, task: {cli_task}, status: complete, summary: {cli_summary}")
+
+    def _minion_complete_callback(self, result: dict, result_file: Path, query: str, session_id: str):
+        """Callback when a minion subprocess writes its result file.
+
+        Unlike CLI agents, minion summaries do NOT auto-append to the parent's scratchpad —
+        the structured exit summary is the entire deliverable and surfaces directly as a
+        <minion_completed> tool response on the parent's next iteration.
+        """
+        task_id = result_file.stem
+        with self._cli_agent_lock:
+            self._minion_tasks = [t for t in self._minion_tasks if t["result_file"] != result_file]
+            self._minion_completed.append({
+                "query": query,
+                "session_id": session_id,
+                "summary": result.get("summary", ""),
+                "status": result.get("status", "complete"),
+            })
+            logger.info(f"Minion completed (session {session_id}): {result.get('status', 'complete')}")
+
+        self._safe_cli_emit("task_end", task_id, result.get("status", "complete"), result.get("summary", ""))
     
     def get_cli_agent_status(self) -> dict:
         """Get current CLI agent status for main agent to check"""
@@ -545,8 +576,8 @@ class ControllerView:
                     watcher_thread.daemon = True
                     watcher_thread.start()
                     
-                    self.milestone_service.append_milestone(f"CLI Agent started, task: {task_description}, status: pending")
-                    
+                    self.scratchpad_service.append_scratchpad(f"CLI Agent started, task: {task_description}, status: pending")
+
                     result = {
                         "status": "success",
                         "action": "tool",
@@ -555,7 +586,117 @@ class ControllerView:
                         "message": "CLI Agent started in parallel. Continue with other tasks."
                     }
                     results.append(result)
-                    
+
+                elif action_type == "minion":
+                    # DISPATCH MODE: spawn a read-only minion sub-agent.
+                    # Multiple minions in one action_list spawn in parallel; the
+                    # implicit-await block at the end of this action loop blocks
+                    # until ALL spawned minions have written their result file.
+                    minion_query = action_item.get("value", "")
+                    logger.info(f"Starting Minion for query: {minion_query}")
+
+                    result_file = Path("cli_minion_result") / f"result_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.json"
+                    result_file.parent.mkdir(parents=True, exist_ok=True)
+                    minion_session_id = uuid.uuid4().hex[:8]
+
+                    if IS_COMPILED:
+                        exe_dir = os.path.dirname(sys.executable)
+                        main_exe = os.path.join(exe_dir, "AutoUse.exe")
+                        cli_cmd = [
+                            main_exe, "--minion-mode",
+                            "--task", minion_query,
+                            "--provider", self.provider or "openrouter",
+                            "--model", self.model or "gemini-3-flash",
+                            "--result", str(result_file),
+                        ]
+                    else:
+                        cli_cmd = [
+                            sys.executable, "-m", "Auto_Use.windows_use.agent.cli.minions",
+                            "--task", minion_query,
+                            "--provider", self.provider or "openrouter",
+                            "--model", self.model or "gemini-3-flash",
+                            "--result", str(result_file),
+                        ]
+
+                    if self.api_key:
+                        cli_cmd.extend(["--api_key", self.api_key])
+
+                    cli_env = os.environ.copy()
+                    cli_env["PYTHONUNBUFFERED"] = "1"
+                    minion_proc = None
+
+                    if self.external_terminal:
+                        try:
+                            new_console_flag = (
+                                subprocess.CREATE_NEW_CONSOLE
+                                if sys.platform == "win32"
+                                else 0
+                            )
+                            minion_proc = subprocess.Popen(
+                                cli_cmd, creationflags=new_console_flag, env=cli_env
+                            )
+                            debug_log(f"Minion launched in new console (PID: {minion_proc.pid})")
+                        except Exception as e:
+                            debug_log(f"Minion failed to start in new console: {e}", "ERROR")
+                    else:
+                        try:
+                            minion_proc = subprocess.Popen(
+                                cli_cmd,
+                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=cli_env,
+                            )
+                            debug_log(f"Minion subprocess started (PID: {minion_proc.pid})")
+                        except Exception as e:
+                            debug_log(f"Minion subprocess failed to start: {e}", "ERROR")
+
+                    task_id = result_file.stem
+                    with self._cli_agent_lock:
+                        self._minion_tasks.append({
+                            "query": minion_query,
+                            "subprocess": minion_proc,
+                            "result_file": result_file,
+                            "session_id": minion_session_id,
+                        })
+
+                    self._safe_cli_emit("task_start", task_id, f"[minion] {minion_query}")
+                    if minion_proc is not None and not self.external_terminal:
+                        for pipe, stream_name in (
+                            (minion_proc.stdout, "out"),
+                            (minion_proc.stderr, "err"),
+                        ):
+                            t = threading.Thread(
+                                target=self._read_cli_stream,
+                                args=(pipe, task_id, stream_name),
+                                daemon=True,
+                            )
+                            t.start()
+
+                    def watch_minion_result(rf=result_file, q=minion_query, sid=minion_session_id):
+                        while True:
+                            if rf.exists():
+                                try:
+                                    with open(rf, 'r', encoding='utf-8') as f:
+                                        result_data = json.load(f)
+                                    rf.unlink()
+                                    self._minion_complete_callback(result_data, rf, q, sid)
+                                except Exception as e:
+                                    logger.error(f"Error reading minion result: {e}")
+                                break
+                            time.sleep(1)
+
+                    watcher_thread = threading.Thread(target=watch_minion_result)
+                    watcher_thread.daemon = True
+                    watcher_thread.start()
+
+                    # Placeholder — patched after the implicit-await at end of action loop.
+                    results.append({
+                        "_pending_minion": True,
+                        "query": minion_query,
+                        "session_id": minion_session_id,
+                    })
+
                 elif action_type == "todo_list":
                     todo_value = action_item.get("value")
                     self.task_tracker.save_todo(todo_value)
@@ -575,17 +716,17 @@ class ControllerView:
                             "message": "Could not update task"
                         }
                 
-                elif action_type == "milestone":
-                    milestone_value = action_item.get("value")
-                    success = self.milestone_service.append_milestone(milestone_value)
+                elif action_type == "scratchpad":
+                    scratchpad_value = action_item.get("value")
+                    success = self.scratchpad_service.append_scratchpad(scratchpad_value)
                     if success:
-                        result = {"status": "success", "action": "milestone_added", "milestone": milestone_value}
+                        result = {"status": "success", "action": "scratchpad_added", "scratchpad": scratchpad_value}
                         results.append(result)
                     else:
                         return {
                             "status": "error",
-                            "action": "milestone_failed",
-                            "message": "Could not add milestone"
+                            "action": "scratchpad_failed",
+                            "message": "Could not add scratchpad entry"
                         }
                         
                 elif action_type == "done":
@@ -730,7 +871,58 @@ class ControllerView:
                 if results and results[-1].get("status") == "stopped":
                     self.controller_service.release_all_inputs()
                     return results[-1]
-            
+
+            # Implicit await: if any minions were dispatched in this action, block
+            # until all of them have written their result files, then patch each
+            # placeholder in `results` with the structured tool response. Single
+            # minion → wait for that one. N minions → wait for all N (parallel).
+            with self._cli_agent_lock:
+                pending_minion_count = len(self._minion_tasks)
+            if pending_minion_count > 0:
+                while True:
+                    if self.stop_event is not None and self.stop_event.is_set():
+                        # User cancel — terminate any minions still running
+                        with self._cli_agent_lock:
+                            for t in self._minion_tasks:
+                                proc = t.get("subprocess")
+                                if proc and proc.poll() is None:
+                                    try:
+                                        proc.terminate()
+                                    except Exception:
+                                        pass
+                            self._minion_tasks.clear()
+                        break
+                    with self._cli_agent_lock:
+                        if not self._minion_tasks:
+                            break
+                    time.sleep(0.5)
+
+                # Patch placeholder entries with real outcomes (match by session_id).
+                with self._cli_agent_lock:
+                    completed_by_sid = {c["session_id"]: c for c in self._minion_completed}
+                for i, r in enumerate(results):
+                    if isinstance(r, dict) and r.get("_pending_minion"):
+                        sid = r.get("session_id")
+                        completion = completed_by_sid.get(sid)
+                        if completion is None:
+                            results[i] = {
+                                "status": "error",
+                                "action": "minion_completed",
+                                "query": r.get("query", ""),
+                                "output": "Minion did not return a result (subprocess crashed or was terminated).",
+                            }
+                        else:
+                            results[i] = {
+                                "status": "success" if completion.get("status") == "complete" else "error",
+                                "action": "minion_completed",
+                                "query": r.get("query", ""),
+                                "output": completion.get("summary", ""),
+                            }
+                # Clear consumed completions so a future action's minions start fresh.
+                with self._cli_agent_lock:
+                    self._minion_completed = [c for c in self._minion_completed
+                                              if c["session_id"] not in completed_by_sid]
+
             if len(results) == 0:
                 return {"status": "error", "message": "No valid action found"}
             elif len(results) == 1:
@@ -931,15 +1123,15 @@ class ControllerView:
                         "message": "Could not update task"
                     }
             
-            elif action_key == "milestone":
-                success = self.milestone_service.append_milestone(action_value)
+            elif action_key == "scratchpad":
+                success = self.scratchpad_service.append_scratchpad(action_value)
                 if success:
-                    return {"status": "success", "action": "milestone_added", "milestone": action_value}
+                    return {"status": "success", "action": "scratchpad_added", "scratchpad": action_value}
                 else:
                     return {
                         "status": "error",
-                        "action": "milestone_failed",
-                        "message": "Could not add milestone"
+                        "action": "scratchpad_failed",
+                        "message": "Could not add scratchpad entry"
                     }
 
             elif action_key == "exit":

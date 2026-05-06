@@ -184,7 +184,7 @@ class AgentService:
         """Load system prompt from file"""
         current_dir = os.path.dirname(os.path.abspath(__file__))
         prompt_path = os.path.join(current_dir, "system_prompt.md")
-        
+
         with open(prompt_path, 'r', encoding='utf-8') as f:
             return f.read()
     
@@ -540,10 +540,17 @@ output: {result.get("output", "")}
                             formatted_results.append(f"""<todo_updated>
 task: {result.get("task", "")}
 </todo_updated>""")
-                        elif result.get("action") == "milestone_added":
-                            formatted_results.append(f"""<milestone_added>
-milestone: {result.get("milestone", "")}
-</milestone_added>""")
+                        elif result.get("action") == "scratchpad_added":
+                            formatted_results.append(f"""<scratchpad_added>
+scratchpad: {result.get("scratchpad", "")}
+</scratchpad_added>""")
+                        elif result.get("action") == "minion_completed":
+                            formatted_results.append(f"""<minion_completed>
+status: {result.get("status", "")}
+query: {result.get("query", "")}
+output:
+{result.get("output", "")}
+</minion_completed>""")
                         else:
                             # For other actions, simple format
                             action_name = result.get("action", "result")
