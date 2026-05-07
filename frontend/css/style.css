@@ -2101,6 +2101,10 @@ body.cli-mode .settings-btn {
     padding: clamp(7px, 0.8vw, 11px) clamp(12px, 1.4vw, 18px) clamp(7px, 0.8vw, 11px) clamp(10px, 1.2vw, 14px);
     border-radius: clamp(20px, 2.6vw, 30px);
     overflow: hidden;
+    /* Default stacking: 1. Animating minion pills drop to z-index: 0 in their
+       keyframes so they slide behind their non-animating siblings (the pill
+       directly above masks the moving one — that's the "going behind" feel). */
+    z-index: 1;
     animation: cli-pill-in 0.35s cubic-bezier(0.25, 0.8, 0.25, 1) both;
     transition: max-height 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
@@ -2251,4 +2255,133 @@ body.cli-mode .settings-btn {
 
 .cli-pill.complete .cli-output {
     max-height: 1.6em;
+}
+
+/* ============================================================
+   Minion pill — child variant of cli-pill.
+   Card-stack choreography: each minion is wrapped in a .cli-minion-wrap
+   that has overflow: hidden. The wrapper grows in height while the
+   inner pill translates from -100% to 0 — the wrapper's top edge sits
+   directly below the predecessor's bottom edge in flex flow, so the
+   pill geometrically slides out from behind that predecessor. On
+   absorb, the wrapper collapses while the inner pill translates back
+   to -100% — pill tucks back behind the predecessor.
+   Real geometric clip via overflow:hidden, not z-index masking, so
+   it works through the translucent liquid-glass pills.
+   ============================================================ */
+
+.cli-minion-wrap {
+    /* Default matches .cli-pill min-height so the wrapper hugs the inner pill
+       exactly. JS overrides this inline (`wrap.style.--minion-h = pill.offsetHeight`)
+       after spawn for a pixel-perfect fit — no empty space inside the wrapper,
+       so flex-column gap between sibling wrappers stays uniform. */
+    --minion-h: clamp(38px, 4vw, 52px);
+    display: block;
+    align-self: center;     /* narrower than parent, centered in flex column */
+    width: 75%;
+    overflow: hidden;       /* the real clip: hides the pill above the wrapper top */
+    height: 0;
+    animation: cli-minion-wrap-drop 0.45s cubic-bezier(0.25, 0.8, 0.25, 1) forwards;
+}
+
+.cli-minion-wrap > .cli-pill.minion {
+    width: 100%;            /* fill the wrapper (which already owns the 75% width) */
+    margin: 0;
+    animation: cli-minion-pill-drop 0.45s cubic-bezier(0.25, 0.8, 0.25, 1) both;
+}
+
+@keyframes cli-minion-wrap-drop {
+    from { height: 0; }
+    to   { height: var(--minion-h, 80px); }
+}
+
+@keyframes cli-minion-pill-drop {
+    from { transform: translateY(-100%); }
+    to   { transform: translateY(0); }
+}
+
+.cli-minion-wrap.absorbing {
+    pointer-events: none;
+    animation: cli-minion-wrap-absorb 0.45s cubic-bezier(0.55, 0, 0.45, 1) forwards;
+}
+
+.cli-minion-wrap.absorbing > .cli-pill.minion {
+    animation: cli-minion-pill-absorb 0.45s cubic-bezier(0.55, 0, 0.45, 1) forwards;
+}
+
+@keyframes cli-minion-wrap-absorb {
+    from { height: var(--minion-h, 80px); }
+    to   { height: 0; }
+}
+
+@keyframes cli-minion-pill-absorb {
+    from { transform: translateY(0); }
+    to   { transform: translateY(-100%); }
+}
+
+/* ============================================================
+   Web-loading state on a pill.
+   When the pill enters .web-loading (e.g. CLI agent's web tool is fetching),
+   the streamed output is muted and a clean "web" label with three pulsing
+   dots takes its place. Comes off when the web call completes.
+   ============================================================ */
+
+/* Mute the streaming output without removing it from the DOM, so when the
+   web call ends the next streamed line continues from where it left off. */
+.cli-pill.web-loading .cli-output {
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+
+/* The "web" label + dots overlay, drawn into the pill body. ::after on the
+   .cli-pill-body so it sits over the muted .cli-output, vertically centered. */
+.cli-pill.web-loading .cli-pill-body {
+    position: relative;
+}
+.cli-pill.web-loading .cli-pill-body::after {
+    content: 'web';
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: clamp(11px, 0.85vw, 12.5px);
+    color: rgba(70, 70, 75, 0.92);
+    pointer-events: none;
+    /* Three pulsing dots are added below via a sibling ::before pseudo-element
+       containing radial-gradient circles; each fades in and out staggered. */
+}
+
+/* Three pulsing dots after the "web" text. We render them as a radial-gradient
+   pattern on a single ::before so we don't need extra DOM, then animate the
+   background-position to give the illusion of cascading pulses. */
+.cli-pill.web-loading .cli-pill-body::before {
+    content: '';
+    position: absolute;
+    /* sit just to the right of the "web" label — exact left offset depends on
+       font but ~36px works for the clamp range above. */
+    left: 38px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 22px;
+    height: 6px;
+    background-image:
+        radial-gradient(circle, rgba(70, 70, 75, 0.85) 50%, transparent 60%),
+        radial-gradient(circle, rgba(70, 70, 75, 0.85) 50%, transparent 60%),
+        radial-gradient(circle, rgba(70, 70, 75, 0.85) 50%, transparent 60%);
+    background-repeat: no-repeat;
+    background-size: 4px 4px;
+    background-position: 0 50%, 9px 50%, 18px 50%;
+    /* Each dot fades in and out in sequence — using a simple opacity animation
+       on the whole element produces a soft pulse. For staggered per-dot effects
+       we'd need 3 separate elements (kept simple here). */
+    animation: web-loading-pulse 1.4s ease-in-out infinite;
+    pointer-events: none;
+}
+
+@keyframes web-loading-pulse {
+    0%   { opacity: 0.25; }
+    50%  { opacity: 1; }
+    100% { opacity: 0.25; }
 }

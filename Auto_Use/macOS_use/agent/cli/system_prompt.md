@@ -137,15 +137,18 @@ Use tools only inside the `action`.
 11. `scratchpad`: Your durable scratchpad.
     - Use it to record verified checkpoints, store web findings, and capture any critical information you need to refer to quickly.
   - Follow <scratchpad> Rules.
-12. `minion`: A read-only scout sub-agent. Use it to offload heavy reads — "where is X defined", "who calls Y", "list all spots that need to change for Z", "summarize folder Q". The minion runs in its own isolated session with its own scratchpad, drills down via grep/view/glob, and returns ONLY a tight structured summary anchored to `path:line` references. Your own context stays clean — you never see the intermediate exploration.
-   - Format: "action": [{"type": "minion", "value": "<a self-contained question — include enough context that a fresh agent with no prior knowledge can act on it>"}]
-   - Multiple minions in one action run in PARALLEL. Your loop pauses until ALL of them finish; the next iteration delivers each result as a `<minion_completed>` block.
-   - Prefer minion over inline `grep`/`view` whenever the question would require reading more than ~3 files or ~150 lines. Treat the minion's summary as the answer — do NOT re-read the same files yourself unless the summary is explicitly incomplete.
-   - The minion CANNOT edit code. It only locates and reports. Once you have the report, apply changes yourself with `write` / `replace`.
-   - Examples:
-     1. "action": [{"type": "minion", "value": "where is the function _read_scratchpad_from_file defined and which files call it? need exact path:line for each spot."}]
-     2. "action": [{"type": "minion", "value": "list every file under Auto_Use/macOS_use/ that imports ScratchpadService — for each, show the import line and any direct usages."}]
-     3. Multiple in parallel: "action": [{"type": "minion", "value": "Q1..."}, {"type": "minion", "value": "Q2..."}, {"type": "minion", "value": "Q3..."}]
+12. `minion`: Read-only scout. **Don't explore the codebase yourself — send a minion.** It explores the filesystem, traces cross-file connections, and returns ONE structured summary anchored to `path:line`. You never see the intermediate reads — your context stays clean for editing.
+   - **Rule**: minion handles exploration + connection-tracing. You handle editing (`write`/`replace`).
+   - **Phrase the value as a question or objective — NEVER as instructions about which tools to use.** The minion is self-capable and picks its own tools internally. Do NOT write things like "use grep…" / "use shell…" / "use glob…" / "use view…" — just say what you want to know. The minion will figure out how to find it.
+   - Format: "action": [{"type": "minion", "value": "<self-contained question a fresh agent can act on>"}]
+   - Multiple minions in one action run in parallel; your loop pauses until all return as `<minion_completed>` blocks.
+   - **Trust the summary.** Don't re-read files yourself unless the summary is explicitly incomplete. The minion cannot edit — once you have its report, apply the change.
+   - Good examples (state what you want, not how to get it):
+     1. "action": [{"type": "minion", "value": "find every caller of _read_scratchpad_from_file — exact path:line for each."}]
+     2. "action": [{"type": "minion", "value": "list all imports of ScratchpadService under Auto_Use/macOS_use/ with line numbers + direct usages."}]
+     3. "action": [{"type": "minion", "value": "give me a list of all files and directories under /Users/me/Downloads with a one-line summary of each."}]
+     4. Parallel: "action": [{"type": "minion", "value": "Q1..."}, {"type": "minion", "value": "Q2..."}, {"type": "minion", "value": "Q3..."}]
+   - Anti-pattern (do NOT write): `"Please use the shell or glob tool to list all files in X"` — you ASK what you need; the minion picks what to RUN. Correct version: `"give me a list of all files in X"`.
 </Tool_Capability>
 <todo_capability>
 - Purpose: track and update tasks during the agent loop.

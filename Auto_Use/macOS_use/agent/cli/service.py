@@ -97,7 +97,8 @@ class AgentService:
     
     def __init__(self, provider: str, model: str, save_conversation: bool = False,
                  thinking: bool = True, api_key: str = None, stop_event=None,
-                 task: str = None, on_complete: callable = None):
+                 task: str = None, on_complete: callable = None,
+                 external_terminal: bool = True):
 
         self.provider = provider
         self.model = model
@@ -105,6 +106,10 @@ class AgentService:
         self.stop_event = stop_event
         self.task = task  # Task description (for tracking when called as service)
         self.on_complete = on_complete  # Callback when CLI agent exits
+        # When True, sub-spawns (minions) get their own visible Terminal.app window.
+        # Default True so cli.py and main.py terminal flows show every sub-agent live;
+        # app.py / UI mode can pass False to keep them hidden.
+        self.external_terminal = external_terminal
 
         # Generate unique session ID for complete isolation
         self.session_id = uuid.uuid4().hex[:8]
@@ -118,8 +123,15 @@ class AgentService:
             cli_agent=True
         )
 
-        # Initialize Controller with cli_mode and session_id for complete isolation
-        self.controller = ControllerView(provider=provider, model=model, cli_mode=True, session_id=self.session_id, api_key=api_key)
+        # Initialize Controller with cli_mode + session_id for isolation, and propagate
+        # external_terminal so spawned minions (via the `minion` action) inherit the
+        # same "give each sub-agent its own visible Terminal.app window" behavior.
+        self.controller = ControllerView(
+            provider=provider, model=model,
+            cli_mode=True, session_id=self.session_id,
+            api_key=api_key,
+            external_terminal=external_terminal,
+        )
 
         # Load system prompt
         self.system_prompt = self._load_system_prompt()

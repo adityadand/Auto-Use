@@ -1448,11 +1448,11 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     // Per-word fade-in stagger. Higher = calmer reading pace.
-    const CLI_WORD_STAGGER_MS  = 80;
+    const CLI_WORD_STAGGER_MS  = 45;
     // Hold a finished page (full pill width filled) before clearing for the next page.
-    const CLI_PAGE_HOLD_MS     = 750;
+    const CLI_PAGE_HOLD_MS     = 550;
     // Hold between distinct lines (after the final page of a line completes).
-    const CLI_LINE_HOLD_MS     = 380;
+    const CLI_LINE_HOLD_MS     = 260;
 
     // Per-pill line queue + runner. Incoming task_line events get queued and
     // played back one at a time so the user always sees each line stream
@@ -1555,6 +1555,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const text = line == null ? '' : String(line);
         if (text.trim() === '') return;  // skip blanks so the pill never flashes empty
+        // Real line wins over filler. Stop the filler loop; if this pill still
+        // has running minions, the next idle window will re-arm filler.
+        const fs = _fillerState.get(taskId);
+        if (fs) {
+            _stopFiller(taskId);
+            if (fs.hasMinion) _scheduleFillerStart(taskId);
+        }
         const runner = _getRunner(pill);
         runner.queue.push({ text, stream });
         _pumpCliRunner(pill, runner);
@@ -1565,6 +1572,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!pill) return;
         pill.dataset.status = status || 'complete';
         pill.classList.add('complete');
+        // Parent's done — stop any in-flight filler chatter.
+        _stopFiller(taskId);
+        _fillerState.delete(taskId);
         if (summary) {
             // Route the summary through the same paginated queue as regular
             // lines so it streams in with the same calm pacing.
@@ -1611,5 +1621,379 @@ document.addEventListener('DOMContentLoaded', () => {
         setTimeout(() => {
             if (cliStreamList) cliStreamList.innerHTML = '';
         }, 450);
+    };
+
+    // =====================================================================
+    // Minion pill choreography (narrower, darker children of CLI pills).
+    // Birth: drop top-to-bottom, one at a time (~120ms apart).
+    // Death: when ALL minion siblings of the same parent are complete,
+    //        collapse bottom-to-top (last absorbed first), each absorb
+    //        staggered ~150ms apart, fading into the parent's bottom edge.
+    // =====================================================================
+
+    const cliMinionPillTemplate = document.getElementById('cliMinionPillTemplate');
+
+    const MINION_DROP_STAGGER_MS    = 120;
+    const MINION_ABSORB_DELAY_MS    = 200;
+    const MINION_ABSORB_STAGGER_MS  = 150;
+
+    // Per-parent drop queue so events arriving in a burst still cascade visually.
+    const _minionDropQueue = new Map();  // parentTaskId -> { queue: [...], running: bool }
+
+    // ---------- Filler phrase loop ----------
+    // While a parent CLI pill has running minions but is itself silent (no new
+    // lines streaming), the pill goes blank and looks frozen. Push playful
+    // status phrases into the parent's runner so the user knows it's alive and
+    // waiting on its minions. Stops the moment a real line comes in or the
+    // minion batch finishes.
+    const FILLER_PHRASES = [
+        'summoned minions…',
+        'digging through the codebase…',
+        "don't bother me, i'm busy still",
+        'reticulating splines…',
+        'consulting the rubber duck…',
+        'untangling spaghetti…',
+        'watching minions go brrr…',
+        'this is fine, everything is fine…',
+        'spinning up neurons…',
+        'arguing with the linter…',
+        'minions are reading… patience, human',
+        'pondering the orb…',
+        'grepping the unknown…',
+        'feeding the hamsters…',
+        'still thinking, hold tight…',
+        'writing tiny love letters to stdout…',
+        'asking stack overflow nicely…',
+        'looking for the missing semicolon…',
+        'blaming the intern…',
+        'performing arcane git rituals…',
+        'have you tried turning it off and on…',
+        'just one more refactor, i promise…',
+        'regex go brrr…',
+        'negotiating with the type checker…',
+        "Schrödinger's bug: works on my machine…",
+        'pretending to understand recursion…',
+        'this codebase has feelings too…',
+        'arguing with prettier…',
+        'i swear i tested this earlier…',
+        "checking if it's a feature, not a bug…",
+        'the code works, nobody knows why…',
+        'reading documentation as last resort…',
+        'blaming the cache…',
+        'praying to the build gods…',
+        'git blame says it was past me…',
+        'compiling existential dread…',
+        'tabs vs spaces war ongoing…',
+        'training a goldfish to write tests…',
+        'minions arguing over indentation…',
+        'still cheaper than a senior dev…',
+        'pushing to prod on a friday…',
+        'one does not simply async in python…',
+        '404: motivation not found…',
+        'rewriting it in rust… mentally…',
+        "petting the dog, brb…",
+        'yelling politely at the json…',
+        "checking if it's plugged in…",
+        'the cake is a bug…',
+        'explaining mondays to the AI…',
+        'deploying vibes…',
+        'this stack trace feels personal…',
+        'i was promised flying cars, got jira…',
+        'writing tests… eventually…',
+        'minions on coffee break…',
+        "this wasn't in the spec…",
+        'ctrl-z is my therapist…',
+        'running from technical debt…',
+        'console.log debugger gang…',
+        'the docs lied to us…',
+        'trying to remember what i was doing…',
+        'rebooting reality…',
+        "yes, that's a feature now…",
+        'speedrun: any% blame git…',
+        'thinking too hard, please wait…',
+        'yet another deeply nested if…',
+        'promise resolved with disappointment…',
+        'hot reload, cold coffee…',
+        'aligning ducks in rows…',
+        'one liner that took two hours…',
+        'naming things, the hardest problem…',
+        'off-by-one somewhere, definitely…',
+        'loading more excuses…',
+        'the bug is in another castle…',
+        'your code is fine, the universe is broken…',
+        'the linter has strong opinions…',
+        'minion overheard saying lgtm…',
+        'convincing the tests to pass…',
+        'renaming the variable to fix it…',
+        'drowning in callback hell…',
+        '73 unread warnings, vibes only…',
+        "yes it works, no i don't know why…",
+        'minions found 47 todos, ignored all…',
+        'scrolling error logs like reels…',
+        'two minions, one task…',
+        'sacrificing a keyboard to the demo gods…',
+        'undoing the undo…',
+        'reading the error message, finally…',
+        'minions whispering to each other…',
+        'the algorithm has thoughts…',
+        'trying not to break prod…',
+        'minion union meeting in progress…',
+        'shaking the magic 8-ball…',
+        'asking the cat for code review…',
+        'running tests with fingers crossed…',
+        'exorcising the legacy code…',
+        'i promise this is the last bug…',
+        'binary search through 200 tabs…',
+        'feature creep is a feature now…',
+        'minions found a TODO from 2014…',
+        'deprecated, but still working…',
+        'putting console.logs in production…',
+        'redefining what "done" means…',
+    ];
+    const FILLER_IDLE_MS     = 1800;  // silence before filler kicks in
+    const FILLER_INTERVAL_MS = 3500;  // gap between filler phrases
+
+    const _fillerState = new Map();  // parentTaskId -> { active, hasMinion, bag, lastIdx, idleTimer, tickTimer }
+
+    function _ensureFiller(parentTaskId) {
+        let s = _fillerState.get(parentTaskId);
+        if (!s) {
+            s = {
+                active: false,
+                hasMinion: false,
+                bag: [],         // shuffle-bag: indices yet to show this cycle
+                lastIdx: -1,     // last shown index (used to dedupe across reshuffles)
+                idleTimer: null,
+                tickTimer: null,
+            };
+            _fillerState.set(parentTaskId, s);
+        }
+        return s;
+    }
+
+    // Shuffle-bag picker: pop a random unseen phrase. When the bag empties
+    // (full pool consumed), reshuffle the whole pool — so we get the entire
+    // 100 covered before any repeats, then 100 again, etc. Tiny dedupe step
+    // ensures we never get the same phrase back-to-back across a reshuffle.
+    function _nextFillerPhrase(s) {
+        if (!s.bag || s.bag.length === 0) {
+            const bag = FILLER_PHRASES.map((_, i) => i);
+            for (let i = bag.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [bag[i], bag[j]] = [bag[j], bag[i]];
+            }
+            // Avoid repeating the most recent phrase as the first of the new
+            // cycle. If the top of the bag (next to pop) matches lastIdx,
+            // swap it with the bottom.
+            if (s.lastIdx >= 0 && bag.length > 1 && bag[bag.length - 1] === s.lastIdx) {
+                [bag[bag.length - 1], bag[0]] = [bag[0], bag[bag.length - 1]];
+            }
+            s.bag = bag;
+        }
+        const idx = s.bag.pop();
+        s.lastIdx = idx;
+        return FILLER_PHRASES[idx];
+    }
+
+    function _stopFiller(parentTaskId) {
+        const s = _fillerState.get(parentTaskId);
+        if (!s) return;
+        s.active = false;
+        if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
+        if (s.tickTimer) { clearTimeout(s.tickTimer); s.tickTimer = null; }
+    }
+
+    function _scheduleFillerStart(parentTaskId) {
+        const s = _ensureFiller(parentTaskId);
+        if (!s.hasMinion) return;
+        if (s.idleTimer) clearTimeout(s.idleTimer);
+        s.idleTimer = setTimeout(() => {
+            s.idleTimer = null;
+            if (!s.hasMinion) return;
+            s.active = true;
+            const tickFiller = () => {
+                if (!s.active) return;
+                const pill = findCliPill(parentTaskId);
+                if (!pill) { s.active = false; return; }
+                const phrase = _nextFillerPhrase(s);
+                const runner = _getRunner(pill);
+                runner.queue.push({ text: phrase, stream: 'stdout' });
+                _pumpCliRunner(pill, runner);
+                s.tickTimer = setTimeout(tickFiller, FILLER_INTERVAL_MS);
+            };
+            tickFiller();
+        }, FILLER_IDLE_MS);
+    }
+
+    function _findMinionPill(taskId) {
+        if (!cliStreamList) return null;
+        return cliStreamList.querySelector(
+            `.cli-pill.minion[data-task-id="${CSS.escape(String(taskId))}"]`
+        );
+    }
+
+    function _findLastMinionForParent(parentTaskId) {
+        if (!cliStreamList) return null;
+        // Look up wrappers (which carry the layout slot in flex flow) so insertion
+        // appends below the previous wrapper, not inside it.
+        const all = cliStreamList.querySelectorAll(
+            `.cli-minion-wrap[data-parent-task-id="${CSS.escape(String(parentTaskId))}"]`
+        );
+        return all.length > 0 ? all[all.length - 1] : null;
+    }
+
+    function _siblingMinions(parentTaskId) {
+        if (!cliStreamList) return [];
+        return Array.from(cliStreamList.querySelectorAll(
+            `.cli-pill.minion[data-parent-task-id="${CSS.escape(String(parentTaskId))}"]`
+        ));
+    }
+
+    function _spawnMinionPill(parentTaskId, taskId, query) {
+        if (!cliStreamList || !cliMinionPillTemplate) return;
+        if (_findMinionPill(taskId)) return;  // dedupe
+        const parentPill = findCliPill(parentTaskId);
+        if (!parentPill) {
+            console.warn('[minion] no parent pill found for', parentTaskId);
+            return;
+        }
+        const pill = cliMinionPillTemplate.content.firstElementChild.cloneNode(true);
+        pill.dataset.taskId = String(taskId);
+        pill.dataset.parentTaskId = String(parentTaskId);
+        const cmdEl = pill.querySelector('.cli-pill-cmd');
+        if (cmdEl) cmdEl.textContent = query || '';
+
+        // Wrap in a clip container. The wrapper owns the layout slot (height
+        // animates 0 → --minion-h) while the inner pill translates -100% → 0.
+        // Together they produce a real geometric "slide out from behind the
+        // pill above" — the wrapper's overflow:hidden clips against its top
+        // edge, which sits right under the predecessor's bottom edge.
+        const wrap = document.createElement('div');
+        wrap.className = 'cli-minion-wrap';
+        wrap.dataset.parentTaskId = String(parentTaskId);
+        wrap.dataset.taskId = String(taskId);
+        wrap.appendChild(pill);
+
+        // Insert below the last existing minion wrapper of this parent (so the
+        // stack grows downward in dispatch order); otherwise right after the
+        // parent pill.
+        const insertAfter = _findLastMinionForParent(parentTaskId) || parentPill;
+        insertAfter.insertAdjacentElement('afterend', wrap);
+
+        // Measure the inner pill's natural rendered height and lock the wrapper
+        // to that exact value via --minion-h. Without this, the wrapper used a
+        // hardcoded fallback that overshot the pill's actual height, leaving
+        // empty space inside the wrapper that bloated the gap to the next
+        // sibling. We measure on rAF so the browser has computed layout once.
+        requestAnimationFrame(() => {
+            const h = pill.offsetHeight;
+            if (h > 0) wrap.style.setProperty('--minion-h', h + 'px');
+        });
+    }
+
+    function _runMinionDropQueue(parentTaskId) {
+        const state = _minionDropQueue.get(parentTaskId);
+        if (!state || state.running) return;
+        if (state.queue.length === 0) return;
+        state.running = true;
+        const dropOne = () => {
+            const next = state.queue.shift();
+            if (!next) {
+                state.running = false;
+                return;
+            }
+            _spawnMinionPill(parentTaskId, next.taskId, next.query);
+            setTimeout(dropOne, MINION_DROP_STAGGER_MS);
+        };
+        dropOne();
+    }
+
+    window.cliMinionStart = (parentTaskId, taskId, query) => {
+        console.log('[minion] start', parentTaskId, taskId, query);
+        if (!parentTaskId || !taskId) return;
+        if (!_minionDropQueue.has(parentTaskId)) {
+            _minionDropQueue.set(parentTaskId, { queue: [], running: false });
+        }
+        _minionDropQueue.get(parentTaskId).queue.push({ taskId, query });
+        _runMinionDropQueue(parentTaskId);
+        // Mark parent as having minions and arm the idle filler watcher. If the
+        // parent goes silent for FILLER_IDLE_MS, filler phrases start streaming.
+        const fs = _ensureFiller(parentTaskId);
+        fs.hasMinion = true;
+        _scheduleFillerStart(parentTaskId);
+    };
+
+    // Stream a line from a running minion's stdout/stderr into its pill body.
+    // Reuses the parent-pill word-pagination runner so minion output looks identical
+    // to CLI agent output — same word-by-word fade, same per-page hold.
+    window.cliMinionLine = (taskId, line, stream) => {
+        const pill = _findMinionPill(taskId);
+        if (!pill) return;
+        const text = line == null ? '' : String(line);
+        if (text.trim() === '') return;  // skip blanks so pill body never flashes empty
+        const runner = _getRunner(pill);
+        runner.queue.push({ text, stream });
+        _pumpCliRunner(pill, runner);
+    };
+
+    // Web-loading visual on a pill: when the parent CLI agent (or any pill that owns
+    // the web tool) starts a web search, flip the pill into web-loading mode. CSS
+    // hides the streamed output and shows a clean "web" + 3 pulsing dots indicator.
+    // Triggered from the marker bridge so it works for piped CLI subprocesses
+    // (which can't fire web_callback directly to the frontend).
+    window.cliPillWebLoadingStart = (taskId) => {
+        const pill = findCliPill(taskId);
+        if (pill) pill.classList.add('web-loading');
+    };
+    window.cliPillWebLoadingEnd = (taskId) => {
+        const pill = findCliPill(taskId);
+        if (pill) pill.classList.remove('web-loading');
+    };
+
+    window.cliMinionEnd = (taskId, status, summary) => {
+        console.log('[minion] end', taskId, status, summary);
+        const pill = _findMinionPill(taskId);
+        if (!pill) return;
+        pill.dataset.status = status || 'complete';
+        pill.classList.add('complete');
+
+        // Wait for ALL siblings (same parent) to complete, then cascade absorb
+        // bottom-to-top. We re-check on each end event — last one tips the cascade.
+        const parentId = pill.dataset.parentTaskId;
+        const siblings = _siblingMinions(parentId);
+        const allComplete = siblings.length > 0
+            && siblings.every(s => s.classList.contains('complete'));
+        if (!allComplete) return;
+
+        const reversed = siblings.slice().reverse();  // bottom-most absorbed first
+        setTimeout(() => {
+            reversed.forEach((s, i) => {
+                setTimeout(() => {
+                    if (!s.isConnected) return;
+                    // Drive the absorb on the wrapper so its height collapses in
+                    // sync with the inner pill's translateY → -100%. Removing the
+                    // wrapper takes the pill with it.
+                    const wrap = s.parentElement && s.parentElement.classList.contains('cli-minion-wrap')
+                        ? s.parentElement
+                        : s;
+                    wrap.classList.add('absorbing');
+                    wrap.addEventListener('animationend', (ev) => {
+                        // Both wrapper and inner pill fire animationend; only act
+                        // on the wrapper's own height animation so we don't remove
+                        // mid-flight from the inner pill's transform animation.
+                        if (ev.target !== wrap) return;
+                        if (wrap.isConnected) wrap.remove();
+                    });
+                }, i * MINION_ABSORB_STAGGER_MS);
+            });
+            // Drop the per-parent drop queue state — the next batch (if any)
+            // starts fresh.
+            _minionDropQueue.delete(parentId);
+            // Batch is done — minions have all completed and are absorbing.
+            // Kill any active/pending filler so the parent pill doesn't keep
+            // muttering jokes after its children are gone.
+            _stopFiller(parentId);
+            _fillerState.delete(parentId);
+        }, MINION_ABSORB_DELAY_MS);
     };
 });

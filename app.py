@@ -663,6 +663,41 @@ def send_cli_event_to_frontend(event_type, *args):
             webview_window.evaluate_js(
                 f"window.cliTaskEnd && window.cliTaskEnd('{task_id}', '{status}', '{summary}')"
             )
+        elif event_type == "minion_start":
+            # parent_task_id is the spawning CLI agent's task_id; task_id is the minion's own.
+            parent_task_id = _js_escape(args[0] if len(args) > 0 else "")
+            task_id = _js_escape(args[1] if len(args) > 1 else "")
+            query = _js_escape(args[2] if len(args) > 2 else "")
+            webview_window.evaluate_js(
+                f"window.cliMinionStart && window.cliMinionStart('{parent_task_id}', '{task_id}', '{query}')"
+            )
+        elif event_type == "minion_end":
+            task_id = _js_escape(args[0] if len(args) > 0 else "")
+            status = _js_escape(args[1] if len(args) > 1 else "complete")
+            summary = _js_escape(args[2] if len(args) > 2 else "")
+            webview_window.evaluate_js(
+                f"window.cliMinionEnd && window.cliMinionEnd('{task_id}', '{status}', '{summary}')"
+            )
+        elif event_type == "minion_line":
+            # Live stdout/stderr from a running minion — streams into its pill body.
+            task_id = _js_escape(args[0] if len(args) > 0 else "")
+            line = _js_escape(args[1] if len(args) > 1 else "")
+            stream = _js_escape(args[2] if len(args) > 2 else "out")
+            webview_window.evaluate_js(
+                f"window.cliMinionLine && window.cliMinionLine('{task_id}', '{line}', '{stream}')"
+            )
+        elif event_type == "pill_web_loading_start":
+            # Web tool started inside a piped CLI subprocess — show clean dots-loading
+            # visual on the parent CLI pill (replaces the ugly "🌐 Web..." stream).
+            task_id = _js_escape(args[0] if len(args) > 0 else "")
+            webview_window.evaluate_js(
+                f"window.cliPillWebLoadingStart && window.cliPillWebLoadingStart('{task_id}')"
+            )
+        elif event_type == "pill_web_loading_end":
+            task_id = _js_escape(args[0] if len(args) > 0 else "")
+            webview_window.evaluate_js(
+                f"window.cliPillWebLoadingEnd && window.cliPillWebLoadingEnd('{task_id}')"
+            )
     except Exception:
         debug_exception(f"send_cli_event_to_frontend({event_type})")
 

@@ -98,7 +98,17 @@ class ControllerView:
         self._minion_completed = []   # Done: [{"query": str, "session_id": str, "summary": str, "status": str}]
     
     def _web_loading_animation(self):
-        """Display animated loading indicator for web search"""
+        """Display animated loading indicator for web search.
+
+        Skipped when stdout is NOT a TTY (i.e. piped subprocess) — the `\r`
+        carriage-return overwrite trick only works in a real terminal; in a pipe
+        all the partial writes accumulate and stream into the parent's reader as
+        ugly text like "🌐 Web 🌐 Web. 🌐 Web..." which then floods the pill.
+        In pipe mode the UI gets a clean web-loading visual via the
+        web_loading_start/end events emitted from the web action handler.
+        """
+        if not sys.stdout.isatty():
+            return
         dots = ["", ".", "..", "..."]
         idx = 0
         while not self._stop_loading:
@@ -108,19 +118,41 @@ class ControllerView:
             time.sleep(0.5)
     
     def _safe_cli_emit(self, event_type: str, *args):
-        """Invoke self.cli_callback safely; never let a callback exception bubble up."""
-        if not self.cli_callback:
+        """Invoke self.cli_callback safely; never let a callback exception bubble up.
+
+        Subprocess fallback: when there's no direct callback (CLI agent running as
+        a piped subprocess of the main agent in app.py UI mode) and stdout is NOT
+        a TTY, emit the event as a tagged JSON marker on stdout. The main agent's
+        reader thread picks the marker up and re-emits it through ITS callback so
+        UI events from the CLI subprocess (like minion lifecycle) reach the pill.
+        Skipped in cli.py terminal mode (stdout is a TTY) — keeps the user's
+        terminal output clean of internal protocol lines.
+        """
+        if self.cli_callback:
+            try:
+                self.cli_callback(event_type, *args)
+            except Exception as e:
+                logger.error(f"cli_callback({event_type}) failed: {e}")
             return
-        try:
-            self.cli_callback(event_type, *args)
-        except Exception as e:
-            logger.error(f"cli_callback({event_type}) failed: {e}")
+        if self.cli_mode and not sys.stdout.isatty():
+            try:
+                payload = json.dumps({"event": event_type, "args": list(args)}, ensure_ascii=False)
+                sys.stdout.write(f"__MINION_UI_EVENT__:{payload}\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
     def _read_cli_stream(self, pipe, task_id: str, stream: str):
         """Reader thread: forwards each line from a subprocess pipe to the frontend.
 
         Loops until the pipe closes (subprocess exit). Each line emits a 'task_line'
         event tagged with task_id and stream ("out" or "err").
+
+        Marker lines (`__MINION_UI_EVENT__:<json>`) are intercepted: they're internal
+        protocol from a piped CLI subprocess forwarding minion lifecycle. Re-emit
+        them as proper `minion_start` / `minion_end` events through this controller's
+        own callback (which has the bridge to the frontend). Marker lines never
+        leak into the parent pill's streaming output.
         """
         if pipe is None:
             return
@@ -134,6 +166,9 @@ class ControllerView:
                     line = str(raw)
                 if line == "" and stream == "err":
                     continue
+                if line.startswith("__MINION_UI_EVENT__:"):
+                    self._handle_minion_marker(line, parent_task_id=task_id)
+                    continue
                 self._safe_cli_emit("task_line", task_id, line, stream)
         except Exception as e:
             logger.error(f"_read_cli_stream({task_id}, {stream}) error: {e}")
@@ -142,6 +177,49 @@ class ControllerView:
                 pipe.close()
             except Exception:
                 pass
+
+    def _handle_minion_marker(self, line: str, parent_task_id: str):
+        """Parse a `__MINION_UI_EVENT__:<json>` marker line emitted by a piped CLI
+        subprocess and re-emit it through this controller's own callback as a
+        proper `minion_start` / `minion_end` event.
+
+        `parent_task_id` is the spawning CLI subprocess's task_id (the result-file
+        stem from the cli_agent dispatch) — used so the frontend can attach the
+        new minion pill below the correct parent pill.
+        """
+        try:
+            payload = json.loads(line[len("__MINION_UI_EVENT__:"):].strip())
+        except Exception as e:
+            logger.error(f"Failed to parse minion marker: {e} | line={line!r}")
+            return
+        inner_event = payload.get("event")
+        inner_args = payload.get("args", [])
+        if inner_event == "task_start":
+            minion_task_id = inner_args[0] if len(inner_args) > 0 else ""
+            minion_desc = inner_args[1] if len(inner_args) > 1 else ""
+            # Strip the "[minion] " prefix the dispatch tags onto descriptions —
+            # the UI shows the raw query, not our internal label.
+            if isinstance(minion_desc, str) and minion_desc.startswith("[minion] "):
+                minion_desc = minion_desc[len("[minion] "):]
+            self._safe_cli_emit("minion_start", parent_task_id, minion_task_id, minion_desc)
+        elif inner_event == "task_end":
+            minion_task_id = inner_args[0] if len(inner_args) > 0 else ""
+            status = inner_args[1] if len(inner_args) > 1 else "complete"
+            summary = inner_args[2] if len(inner_args) > 2 else ""
+            self._safe_cli_emit("minion_end", minion_task_id, status, summary)
+        elif inner_event == "task_line":
+            # Minion's stdout/stderr lines — stream into the minion pill body so
+            # the user sees live progress (mirrors how parent CLI pills stream).
+            minion_task_id = inner_args[0] if len(inner_args) > 0 else ""
+            line_text = inner_args[1] if len(inner_args) > 1 else ""
+            line_stream = inner_args[2] if len(inner_args) > 2 else "out"
+            self._safe_cli_emit("minion_line", minion_task_id, line_text, line_stream)
+        elif inner_event == "web_loading_start":
+            # Web tool started inside the piped CLI subprocess — flip the parent
+            # CLI pill into web-loading visual state. parent_task_id IS the pill.
+            self._safe_cli_emit("pill_web_loading_start", parent_task_id)
+        elif inner_event == "web_loading_end":
+            self._safe_cli_emit("pill_web_loading_end", parent_task_id)
 
     def _cli_agent_complete_callback(self, result: dict, result_file: Path):
         """Callback when CLI agent finishes execution"""
@@ -386,29 +464,37 @@ class ControllerView:
                 elif action_type == "web":
                     query = action_item.get("value")
                     logger.info(f"Performing web search: {query}")
-                    
+
                     if self.web_callback:
                         self.web_callback("start")
-                    
+                    # In CLI subprocess (no web_callback), this fires the marker bridge
+                    # so the parent CLI pill flips into web-loading visual on the frontend.
+                    self._safe_cli_emit("web_loading_start")
+
                     self._stop_loading = False
                     loading_thread = threading.Thread(target=self._web_loading_animation)
                     loading_thread.daemon = True
                     loading_thread.start()
-                    
+
                     try:
                         web_service = WebService(self.provider, self.model, self.api_key)
                         web_result = web_service.search(query)
                     finally:
                         self._stop_loading = True
                         loading_thread.join(timeout=1)
-                        sys.stdout.write("\r" + " " * 50 + "\r")
-                        sys.stdout.flush()
+                        # Clear the in-place text only in TTY mode — in piped subprocess
+                        # this would just dump 50 spaces + carriage returns into the
+                        # parent's reader buffer.
+                        if sys.stdout.isatty():
+                            sys.stdout.write("\r" + " " * 50 + "\r")
+                            sys.stdout.flush()
 
                         if self.web_callback:
                             self.web_callback("end")
                             # Wait for CSS fade-out to complete before next action
                             time.sleep(0.7)
-                    
+                        self._safe_cli_emit("web_loading_end")
+
                     result = {
                         "status": "success",
                         "action": "tool",
@@ -417,7 +503,7 @@ class ControllerView:
                         "result": web_result
                     }
                     results.append(result)
-                
+
                 elif action_type == "cli_await":
                     # AWAIT MODE: freeze pipeline until all CLI tasks complete
                     reason = action_item.get("value", "")
@@ -490,6 +576,13 @@ class ControllerView:
                     
                     if self.api_key:
                         cli_cmd.extend(["--api_key", self.api_key])
+
+                    # Propagate external_terminal to the CLI subprocess. In app.py UI mode
+                    # main agent has external_terminal=False; pass --no_external_terminal so
+                    # the spawned CLI keeps its own minions on PIPE (required for the
+                    # __MINION_UI_EVENT__ marker bridge to reach the frontend).
+                    if not self.external_terminal:
+                        cli_cmd.append("--no_external_terminal")
 
                     cli_env = os.environ.copy()
                     cli_env["PYTHONUNBUFFERED"] = "1"
@@ -1079,10 +1172,11 @@ class ControllerView:
             elif action_key == "web":
                 query = action_value
                 logger.info(f"Performing web search: {query}")
-                
+
                 if self.web_callback:
                     self.web_callback("start")
-                
+                self._safe_cli_emit("web_loading_start")
+
                 self._stop_loading = False
                 loading_thread = threading.Thread(target=self._web_loading_animation)
                 loading_thread.daemon = True
@@ -1094,11 +1188,13 @@ class ControllerView:
                 finally:
                     self._stop_loading = True
                     loading_thread.join(timeout=1)
-                    sys.stdout.write("\r" + " " * 50 + "\r")
-                    sys.stdout.flush()
+                    if sys.stdout.isatty():
+                        sys.stdout.write("\r" + " " * 50 + "\r")
+                        sys.stdout.flush()
 
                     if self.web_callback:
                         self.web_callback("end")
+                    self._safe_cli_emit("web_loading_end")
 
                 return {
                     "status": "success",

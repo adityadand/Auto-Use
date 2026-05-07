@@ -35,8 +35,7 @@ MODEL = "gemini-3.1-pro"  # refer to the model name correctly from model_list.tx
 # Your task here
 task = """
 
-study the the grep glob approach of macos then make the changes in  to windowsus use to have those tools the  directory is desktop/github/Auto-Use. 
-
+ask minion to check what all things are there in mac download directory.
 """
 
 # Control conversation saving
