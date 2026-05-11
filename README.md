@@ -18,8 +18,9 @@
 
 <div align="center">
 
-<video src="demo.mp4" controls autoplay loop muted playsinline preload="metadata" width="720">
-  Your browser doesn't render embedded video in markdown — <a href="demo.mp4">click to watch the demo</a>.
+<video controls autoplay loop muted playsinline preload="metadata" width="720">
+  <source src="https://raw.githubusercontent.com/FunctionFreak/Auto-Use/developer_branch/demo.mp4" type="video/mp4">
+  Your browser can't render embedded video — <a href="https://github.com/FunctionFreak/Auto-Use/raw/developer_branch/demo.mp4">click to download / watch the demo</a>.
 </video>
 
 </div>
