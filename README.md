@@ -18,7 +18,7 @@
 
 <div align="center">
 
-<video src="demo.mp4" autoplay loop muted playsinline width="720">
+<video src="demo.mp4" controls autoplay loop muted playsinline preload="metadata" width="720">
   Your browser doesn't render embedded video in markdown — <a href="demo.mp4">click to watch the demo</a>.
 </video>
 
