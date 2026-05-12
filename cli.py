@@ -35,7 +35,8 @@ MODEL = "gemini-3.1-pro"  # refer to the model name correctly from model_list.tx
 # Your task here
 task = """
 
-ask minion to check what all things are there in mac download directory.
+draw  finanacial report of goldman sachs  this years and last year reprot and save it on desktop
+
 """
 
 # Control conversation saving
