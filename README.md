@@ -138,6 +138,10 @@ Just describe what you want — Auto Use picks the right tool for the job.
 "Find the latest NVIDIA stock price and quarterly revenue"
 ```
 
+<div align="center">
+  <img src="demo/web_search.gif" alt="Auto Use performing a web search task" width="720"/>
+</div>
+
 ### 💻 CLI Task
 ```
 "Check disk space and clean up temp files"
